@@ -1,28 +1,69 @@
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-kube1-deployment
-  labels:
-    app: my-kube-app1
-spec:
-  replicas: 2  # Number of replicas
-  selector:
-    matchLabels:
-      app: my-kube-app1
-  template:
-    metadata:
-      labels:
-        app: my-kube-app1
-    spec:
-      containers:
-        - name: my-kube1-container
-          image: shiv4j/my-kube1:latest  # Your Docker image
-          ports:
-            - containerPort: 3001  # The port where the Node.js app is listening
-          resources:
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
-          env:
-            - name: NODE_ENV
-              value: "production"
+pipeline {
+  agent any
+
+  environment {
+    // EDIT THESE to match your registry & repo
+    REGISTRY = "docker.io"                           // e.g. docker.io or ghcr.io or your-registry.example.com
+    REPO     = "ntgshiva/hello-minikube"             // change if you push under another org/name
+    IMAGE_TAG = "${env.GIT_COMMIT ?: env.BUILD_ID}"  // prefer commit sha if available
+    IMAGE = "${REGISTRY}/${REPO}:${IMAGE_TAG}"
+    // Kubernetes deployment and container names (edit if different inside your YAML)
+    K8S_DEPLOYMENT = "my-kube1-deployment"          // guessed from file name my-kube1-deployment.yaml
+    K8S_CONTAINER = "my-kube1"                      // change to actual container name used in the manifest (if different)
+  }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timestamps()
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Build Docker image') {
+      steps {
+        script {
+          // builds using host docker daemon on the agent
+          docker.build(env.IMAGE)
+        }
+      }
+    }
+
+    stage('Login & Push') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+          sh """
+            echo "$DOCKER_PASS" | docker login ${env.REGISTRY} -u "$DOCKER_USER" --password-stdin
+            docker push ${env.IMAGE}
+          """
+        }
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        // Requires a Jenkins "Secret File" credential containing kubeconfig; id = kubeconfig
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG="$KUBECONFIG_FILE"
+            kubectl version --client || true
+            # Optional: apply manifests if you want to keep manifests in repo (uncomment to use)
+            # kubectl apply -f my-kube1-deployment.yaml
+            # kubectl apply -f my-kube1-service.yaml
+
+            # Use set image to update the deployment to the new image
+            kubectl set image deployment/${K8S_DEPLOYMENT} ${K8S_CONTAINER}=${IMAGE} --record
+            kubectl rollout status deployment/${K8S_DEPLOYMENT} --timeout=120s
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Deployed ${IMAGE} to Kubernetes (deployment ${K8S_DEPLOYMENT})" }
+    failure { echo "Build or deploy failed — check the console output." }
+  }
+}
